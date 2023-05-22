@@ -1,20 +1,11 @@
 # instantiate a reddit instance
 import praw
-import time
-import os 
 from tqdm import tqdm
-from dataclasses import dataclass
-import sqlite3
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import IntegrityError
 from config import settings
-
-@dataclass
-class RedditPost:
-    title: str
-    text: str
-    id: str
-    url: str
-    author: str
-    op_comment: str 
+from models import *
 
 class RedditScraper:
     user_agent = "Comment Extraction (by u/USERNAME)"
@@ -38,12 +29,12 @@ class RedditScraper:
                         op_comment = comment.body
                         break
             yield RedditPost(
-                title=submission.title,
-                text=submission.selftext,
                 id=submission.id,
+                title=submission.title,
+                text=submission.selftext or op_comment,
                 url=submission.url,
                 author=submission.author.name,
-                op_comment=op_comment
+
             )
 
     def get_hot_post(self) -> RedditPost:
@@ -52,43 +43,52 @@ class RedditScraper:
 
 class RedditPostDB:
     def __init__(self, connection_string, drop_existing=False) -> None:
-        self.conn = sqlite3.connect(connection_string)
-        self.c = self.conn.cursor()
-       
+        self.engine = create_engine(connection_string)
+        Session = sessionmaker(bind=self.engine)
+        self.session = Session()
+        self.conn = self.engine.connect()
+
         if drop_existing:
             self.drop_table()
         self.create_table()
 
     def drop_table(self):
-        self.c.execute('''DROP TABLE IF EXISTS reddit_posts''')
+        self.c.execute("DROP TABLE IF EXISTS reddit_posts")
         self.conn.commit()
+        
 
     def create_table(self):
-        self.c.execute('''CREATE TABLE IF NOT EXISTS reddit_posts
-                (title text, text text, id text PRIMARY KEY, url text, author text, op_comment text)''')
+        Base.metadata.create_all(self.engine)
         self.conn.commit()
 
-    def insert_one(self, reddit_post):
-        try:
-            self.c.execute("INSERT INTO reddit_posts VALUES (?, ?, ?, ?, ?, ?)", (reddit_post.title, reddit_post.text, reddit_post.id, reddit_post.url, reddit_post.author, reddit_post.op_comment))
-            self.conn.commit()
-        except sqlite3.IntegrityError:
-            self.conn.rollback()
-            print(f"Skipping duplicate post: {reddit_post.id}")
+    def get_all(self) -> list[RedditPost]:
+        return self.session.query(RedditPost).all()
+    
+    def close(self):
+        self.session.close()
+
+    def insert(self, reddit_post, duplicate='ignore'):
+        if duplicate == 'ignore':
+            try:
+                self.session.add(reddit_post)
+                self.session.commit()
+            except IntegrityError:
+                self.session.rollback()
+        elif duplicate == 'replace':
+            self.session.merge(reddit_post)
+            self.session.commit()
+        else:
+            raise ValueError(f"Duplicate value {duplicate} not recognized")
+        
+    def delete(self, reddit_post):
+        self.session.query(RedditPost).filter(RedditPost.id == reddit_post.id).delete()
+        self.session.commit()
 
 if __name__ == "__main__":
 
-
-    # reddit_conf = {
-    #     "client_id": os.environ["ICOOKIT_REDDIT_USER_ID"],
-    #     "client_secret": os.environ["ICOOKIT_REDDIT_USER_SECRET"],
-    #     "user_agent": "Comment Extraction (by u/USERNAME)",
-    # }
-
-    reddit_scraper = RedditScraper(settings.reddit_user_id, settings.reddit_user_secret)
-    reddit_db = RedditPostDB("reddit.db", drop_existing=True)
+    reddit_scraper = RedditScraper(settings.reddit_client_id, settings.reddit_client_secret)
+    reddit_db = RedditPostDB(settings.database_url , )
     
-
-    for i, reddit_post  in tqdm(enumerate(reddit_scraper.get_hot_posts(limit=100))):
-        reddit_db.insert_one(reddit_post)
+    for i, reddit_post  in tqdm(enumerate(reddit_scraper.get_hot_posts(limit=10))):
+        reddit_db.insert(reddit_post, duplicate='replace')
 
